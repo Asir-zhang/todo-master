@@ -1,0 +1,6 @@
+.claude/
+config.json
+data/
+__pycache__/
+*.pyc
+*.sqlite3

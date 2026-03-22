@@ -1,86 +1,74 @@
 #!/usr/bin/env python3
+"""SQLite-backed todo skill for OpenClaw."""
+
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
+import datetime as dt
 import json
 import os
 import pathlib
+import sqlite3
+import sys
 import tempfile
 import uuid
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterable
 
 
-VERSION = 1
-TZ_CN = timezone(timedelta(hours=8), name="Asia/Shanghai")
+CONFIG_VERSION = 1
+SCHEMA_VERSION = 1
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_DB_NAME = "todos.sqlite3"
 DATE_FMT = "%Y-%m-%d"
-MONTH_FMT = "%Y-%m"
+DATETIME_FMT = "%Y-%m-%dT%H:%M"
 
 STATUS_OPEN = "open"
 STATUS_DONE = "done"
-STATUS_CANCELED = "canceled"
-STATUS_DELETED = "deleted"
-ALL_STATUS = {STATUS_OPEN, STATUS_DONE, STATUS_CANCELED, STATUS_DELETED}
+STATUS_ARCHIVED = "archived"
+ALL_STATUSES = {STATUS_OPEN, STATUS_DONE, STATUS_ARCHIVED}
 
-TYPE_LONG = "long"
-TYPE_SHORT = "short"
-ALL_TYPES = {TYPE_LONG, TYPE_SHORT}
-
-BY_CREATED = "created"
-BY_PLAN = "plan"
-BY_DUE = "due"
-ALL_BY = {BY_CREATED, BY_PLAN, BY_DUE}
-
-DUE_OVERDUE = "overdue"
-DUE_NOT_OVERDUE = "not-overdue"
-DUE_ALL = "all"
-ALL_DUE_STATE = {DUE_OVERDUE, DUE_NOT_OVERDUE, DUE_ALL}
-
-ERR_VALIDATION = "ERR_VALIDATION"
-ERR_NOT_FOUND = "ERR_NOT_FOUND"
-ERR_STORAGE = "ERR_STORAGE"
-ERR_CORRUPTION = "ERR_CORRUPTION"
-ERR_NOT_INITIALIZED = "ERR_NOT_INITIALIZED"
-
-EXIT_VALIDATION = 2
-EXIT_NOT_FOUND = 3
-EXIT_STORAGE = 4
-EXIT_CORRUPTION = 5
+ERROR_PREFIXES = {
+    "validation": "ERR_VALIDATION",
+    "not_found": "ERR_NOT_FOUND",
+    "storage": "ERR_STORAGE",
+    "corruption": "ERR_CORRUPTION",
+    "not_initialized": "ERR_NOT_INITIALIZED",
+}
 
 
 class TodoError(Exception):
-    def __init__(self, prefix: str, message: str, exit_code: int):
+    def __init__(self, kind: str, message: str, exit_code: int) -> None:
         super().__init__(message)
-        self.prefix = prefix
+        self.kind = kind
         self.message = message
         self.exit_code = exit_code
 
 
 class ValidationError(TodoError):
-    def __init__(self, message: str):
-        super().__init__(ERR_VALIDATION, message, EXIT_VALIDATION)
+    def __init__(self, message: str) -> None:
+        super().__init__("validation", message, 2)
 
 
 class NotFoundError(TodoError):
-    def __init__(self, message: str):
-        super().__init__(ERR_NOT_FOUND, message, EXIT_NOT_FOUND)
+    def __init__(self, message: str) -> None:
+        super().__init__("not_found", message, 3)
 
 
 class StorageError(TodoError):
-    def __init__(self, message: str):
-        super().__init__(ERR_STORAGE, message, EXIT_STORAGE)
+    def __init__(self, message: str) -> None:
+        super().__init__("storage", message, 4)
 
 
 class CorruptionError(TodoError):
-    def __init__(self, message: str):
-        super().__init__(ERR_CORRUPTION, message, EXIT_CORRUPTION)
+    def __init__(self, message: str) -> None:
+        super().__init__("corruption", message, 5)
 
 
 class NotInitializedError(TodoError):
-    def __init__(self, message: str):
-        super().__init__(ERR_NOT_INITIALIZED, message, EXIT_VALIDATION)
+    def __init__(self, message: str) -> None:
+        super().__init__("not_initialized", message, 6)
 
 
 class StrictArgumentParser(argparse.ArgumentParser):
@@ -88,747 +76,872 @@ class StrictArgumentParser(argparse.ArgumentParser):
         raise ValidationError(message)
 
 
-@dataclass
-class StorePaths:
+@dataclasses.dataclass
+class BasePaths:
     skill_root: pathlib.Path
-    data_dir: pathlib.Path
-    index_file: pathlib.Path
     config_file: pathlib.Path
 
     @classmethod
-    def from_script(cls) -> "StorePaths":
+    def detect(cls) -> "BasePaths":
         script_path = pathlib.Path(__file__).resolve()
         skill_root = script_path.parent.parent
-        config_file = skill_root / "config.json"
-        data_dir = skill_root / "data"
-        return cls(skill_root=skill_root, data_dir=data_dir, index_file=data_dir / "index.json", config_file=config_file)
-
-    def with_data_dir(self, data_dir: pathlib.Path) -> "StorePaths":
-        return StorePaths(
-            skill_root=self.skill_root,
-            data_dir=data_dir,
-            index_file=data_dir / "index.json",
-            config_file=self.config_file,
-        )
-
-    def month_file(self, month: str) -> pathlib.Path:
-        return self.data_dir / f"todos-{month}.json"
+        return cls(skill_root=skill_root, config_file=skill_root / "config.json")
 
 
-def now_cn() -> datetime:
-    return datetime.now(TZ_CN)
+@dataclasses.dataclass
+class RuntimePaths:
+    data_dir: pathlib.Path
+    db_file: pathlib.Path
+    legacy_index_file: pathlib.Path
 
 
-def now_cn_iso() -> str:
-    return now_cn().isoformat(timespec="seconds")
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
 
 
-def parse_day(value: str, field_name: str) -> date:
+def format_local(value: dt.datetime | None) -> str:
+    if value is None:
+        return "-"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def parse_json_file(path: pathlib.Path) -> dict[str, Any]:
     try:
-        return datetime.strptime(value, DATE_FMT).date()
-    except ValueError as exc:
-        raise ValidationError(f"{field_name} must be YYYY-MM-DD, got: {value}") from exc
-
-
-def parse_iso_datetime(value: str, field_name: str) -> datetime:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise StorageError(f"failed reading file: {path}") from exc
     try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise CorruptionError(f"invalid datetime format for {field_name}: {value}") from exc
-    if parsed.tzinfo is None:
-        raise CorruptionError(f"datetime missing timezone for {field_name}: {value}")
-    return parsed
-
-
-def month_from_day(day_value: str, field_name: str) -> str:
-    return parse_day(day_value, field_name).strftime(MONTH_FMT)
-
-
-def month_from_created_at(created_at: str) -> str:
-    created = parse_iso_datetime(created_at, "created_at").astimezone(TZ_CN)
-    return created.strftime(MONTH_FMT)
-
-
-def compute_archive_month(todo: Dict[str, Any]) -> str:
-    todo_type = todo.get("type")
-    if todo_type == TYPE_LONG and todo.get("due_date"):
-        return month_from_day(todo["due_date"], "due_date")
-    if todo.get("plan_date"):
-        return month_from_day(todo["plan_date"], "plan_date")
-    return month_from_created_at(todo["created_at"])
-
-
-def make_id() -> str:
-    now_ms_hex = hex(int(now_cn().timestamp() * 1000))[2:]
-    return f"t_{now_ms_hex}_{uuid.uuid4().hex[:6]}"
-
-
-def parse_json_object(raw_text: str, source_name: str) -> Dict[str, Any]:
-    try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise CorruptionError(f"{source_name} contains invalid JSON") from exc
+        raise CorruptionError(f"invalid JSON in {path}") from exc
     if not isinstance(parsed, dict):
-        raise CorruptionError(f"{source_name} must be a JSON object")
+        raise CorruptionError(f"{path.name} must contain a JSON object")
     return parsed
 
 
-def atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
+def write_json_file(path: pathlib.Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=str(path.parent),
+            dir=path.parent,
             delete=False,
             prefix=f".{path.name}.",
             suffix=".tmp",
         ) as handle:
-            tmp_path = pathlib.Path(handle.name)
+            temp_path = pathlib.Path(handle.name)
             json.dump(data, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.replace(tmp_path, path)
+        os.replace(temp_path, path)
     except OSError as exc:
         raise StorageError(f"failed writing file: {path}") from exc
 
 
-def default_config() -> Dict[str, Any]:
-    return {"version": VERSION, "initialized": False, "data_dir": "", "timezone": DEFAULT_TIMEZONE}
+def default_config() -> dict[str, Any]:
+    return {
+        "version": CONFIG_VERSION,
+        "initialized": False,
+        "data_dir": "",
+        "database_name": DEFAULT_DB_NAME,
+        "timezone": DEFAULT_TIMEZONE,
+    }
 
 
-def load_config(base_paths: StorePaths) -> Dict[str, Any]:
-    if not base_paths.config_file.exists():
+def load_config(base: BasePaths) -> dict[str, Any]:
+    if not base.config_file.exists():
         return default_config()
-    try:
-        raw = base_paths.config_file.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise StorageError(f"failed reading file: {base_paths.config_file}") from exc
-    cfg = parse_json_object(raw, "config.json")
+    cfg = parse_json_file(base.config_file)
     if not isinstance(cfg.get("version"), int):
         raise CorruptionError("config.json missing integer version")
     if not isinstance(cfg.get("initialized"), bool):
         raise CorruptionError("config.json missing boolean initialized")
     if not isinstance(cfg.get("data_dir"), str):
         raise CorruptionError("config.json missing string data_dir")
+    if not isinstance(cfg.get("database_name"), str):
+        raise CorruptionError("config.json missing string database_name")
     if not isinstance(cfg.get("timezone"), str):
         raise CorruptionError("config.json missing string timezone")
     return cfg
 
 
-def write_config(base_paths: StorePaths, cfg: Dict[str, Any]) -> None:
-    atomic_write_json(base_paths.config_file, cfg)
+def save_config(base: BasePaths, cfg: dict[str, Any]) -> None:
+    write_json_file(base.config_file, cfg)
 
 
-def resolve_configured_data_dir(base_paths: StorePaths, cfg: Dict[str, Any]) -> pathlib.Path:
+def resolve_runtime_paths(base: BasePaths, cfg: dict[str, Any]) -> RuntimePaths:
     configured = cfg.get("data_dir", "").strip()
     if configured:
-        configured_path = pathlib.Path(configured)
-        if not configured_path.is_absolute():
-            raise CorruptionError("config.json data_dir must be absolute when non-empty")
-        return configured_path
-    return base_paths.skill_root / "data"
-
-
-def init_guidance(base_paths: StorePaths) -> str:
-    return (
-        "skill is not initialized. Run one of:\n"
-        f"  python3 {pathlib.Path(__file__).resolve()} init --default\n"
-        f"  python3 {pathlib.Path(__file__).resolve()} init --data-dir /absolute/path"
+        data_dir = pathlib.Path(configured).expanduser()
+        if not data_dir.is_absolute():
+            raise CorruptionError("config.json data_dir must be an absolute path")
+    else:
+        data_dir = base.skill_root / "data"
+    data_dir = data_dir.resolve()
+    database_name = cfg.get("database_name", DEFAULT_DB_NAME).strip() or DEFAULT_DB_NAME
+    return RuntimePaths(
+        data_dir=data_dir,
+        db_file=data_dir / database_name,
+        legacy_index_file=data_dir / "index.json",
     )
 
 
-def ensure_initialized(base_paths: StorePaths, cfg: Dict[str, Any]) -> None:
-    if not cfg.get("initialized", False):
-        raise NotInitializedError(init_guidance(base_paths))
+def init_guidance() -> str:
+    script = pathlib.Path(__file__).resolve()
+    return (
+        "skill is not initialized. Confirm a storage directory with one of:\n"
+        f"  python3 {script} init --default\n"
+        f"  python3 {script} init --data-dir /absolute/existing/path"
+    )
 
 
-def ensure_index(paths: StorePaths) -> Dict[str, Any]:
-    if not paths.index_file.exists():
-        index = {
-            "version": VERSION,
-            "months": [],
-            "id_map": {},
-            "stats": {"open": 0, "done": 0, "canceled": 0, "deleted": 0, "updated_at": now_cn_iso()},
-        }
-        atomic_write_json(paths.index_file, index)
-        return index
+def ensure_initialized(cfg: dict[str, Any]) -> None:
+    if not cfg.get("initialized"):
+        raise NotInitializedError(init_guidance())
 
+
+def ensure_data_dir_exists(paths: RuntimePaths) -> None:
+    if not paths.data_dir.exists():
+        raise StorageError(f"configured data directory does not exist: {paths.data_dir}")
+    if not paths.data_dir.is_dir():
+        raise StorageError(f"configured data path is not a directory: {paths.data_dir}")
+
+
+def parse_due_value(raw: str) -> dt.datetime:
+    clean = raw.strip()
+    if not clean:
+        raise ValidationError("due value cannot be empty")
     try:
-        raw = paths.index_file.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise StorageError(f"failed reading file: {paths.index_file}") from exc
-    index = parse_json_object(raw, "index.json")
-
-    if not isinstance(index.get("version"), int):
-        raise CorruptionError("index.json missing integer version")
-    if not isinstance(index.get("months"), list) or not all(isinstance(x, str) for x in index["months"]):
-        raise CorruptionError("index.json invalid months")
-    if not isinstance(index.get("id_map"), dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in index["id_map"].items()
-    ):
-        raise CorruptionError("index.json invalid id_map")
-    if not isinstance(index.get("stats"), dict):
-        raise CorruptionError("index.json invalid stats")
-
-    for key in ("open", "done", "canceled", "deleted"):
-        if not isinstance(index["stats"].get(key), int):
-            raise CorruptionError(f"index.json stats missing int field: {key}")
-    if not isinstance(index["stats"].get("updated_at"), str):
-        raise CorruptionError("index.json stats.updated_at missing string")
-    parse_iso_datetime(index["stats"]["updated_at"], "stats.updated_at")
-    return index
+        if len(clean) == 10:
+            parsed_date = dt.datetime.strptime(clean, DATE_FMT).date()
+            return dt.datetime.combine(parsed_date, dt.time(23, 59), tzinfo=now_local().tzinfo)
+        naive = dt.datetime.strptime(clean, DATETIME_FMT)
+        return naive.replace(tzinfo=now_local().tzinfo)
+    except ValueError as exc:
+        raise ValidationError("due must be YYYY-MM-DD or YYYY-MM-DDTHH:MM") from exc
 
 
-def validate_todo_shape(todo: Any) -> None:
-    if not isinstance(todo, dict):
-        raise CorruptionError("todo item must be object")
-    required_str = ["id", "title", "type", "status", "created_at", "updated_at", "archive_month"]
-    for field in required_str:
-        if not isinstance(todo.get(field), str) or not todo[field].strip():
-            raise CorruptionError(f"todo missing valid string field: {field}")
-    if todo["type"] not in ALL_TYPES:
-        raise CorruptionError(f"invalid todo type: {todo['type']}")
-    if todo["status"] not in ALL_STATUS:
-        raise CorruptionError(f"invalid todo status: {todo['status']}")
-    parse_iso_datetime(todo["created_at"], "created_at")
-    parse_iso_datetime(todo["updated_at"], "updated_at")
-    if not isinstance(todo.get("tags", []), list) or not all(isinstance(t, str) for t in todo.get("tags", [])):
-        raise CorruptionError("todo.tags must be list[str]")
-    if todo.get("note") is not None and not isinstance(todo["note"], str):
-        raise CorruptionError("todo.note must be string or null")
-    for field in ("plan_date", "due_date"):
-        if todo.get(field) is not None:
-            if not isinstance(todo[field], str):
-                raise CorruptionError(f"todo.{field} must be string or null")
-            parse_day(todo[field], field)
-    if todo["type"] == TYPE_SHORT and not todo.get("plan_date"):
-        raise CorruptionError("short todo missing plan_date")
-    if len(todo["archive_month"]) != 7:
-        raise CorruptionError("todo.archive_month must be YYYY-MM")
+def make_due_end_of_day(day_offset: int) -> dt.datetime:
+    base_day = now_local().date() + dt.timedelta(days=day_offset)
+    return dt.datetime.combine(base_day, dt.time(23, 59), tzinfo=now_local().tzinfo)
 
 
-def ensure_month_file(paths: StorePaths, month: str) -> Dict[str, Any]:
-    file_path = paths.month_file(month)
-    if not file_path.exists():
-        payload = {"version": VERSION, "month": month, "todos": []}
-        atomic_write_json(file_path, payload)
-        return payload
+def parse_priority(value: int) -> int:
+    if value < 1 or value > 5:
+        raise ValidationError("priority must be between 1 and 5")
+    return value
 
+
+def optional_priority(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return parse_priority(value)
+
+
+def make_todo_id() -> str:
+    return f"todo_{uuid.uuid4().hex[:12]}"
+
+
+def serialize_dt(value: dt.datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone().isoformat(timespec="seconds")
+
+
+def deserialize_dt(value: str | None, field_name: str) -> dt.datetime | None:
+    if value is None:
+        return None
     try:
-        raw = file_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise StorageError(f"failed reading file: {file_path}") from exc
-    payload = parse_json_object(raw, file_path.name)
-    if payload.get("month") != month:
-        raise CorruptionError(f"month mismatch in {file_path.name}")
-    if not isinstance(payload.get("version"), int):
-        raise CorruptionError(f"{file_path.name} missing integer version")
-    if not isinstance(payload.get("todos"), list):
-        raise CorruptionError(f"{file_path.name} invalid todos list")
-    for todo in payload["todos"]:
-        validate_todo_shape(todo)
-        if todo["archive_month"] != month:
-            raise CorruptionError(f"{file_path.name} contains todo with mismatched archive_month")
-    return payload
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise CorruptionError(f"invalid datetime in {field_name}: {value}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now_local().tzinfo)
+    return parsed
 
 
-def write_month_file(paths: StorePaths, month: str, payload: Dict[str, Any]) -> None:
-    atomic_write_json(paths.month_file(month), payload)
+def configure_connection(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
 
 
-def write_index(paths: StorePaths, index: Dict[str, Any]) -> None:
-    atomic_write_json(paths.index_file, index)
+def initialize_storage(paths: RuntimePaths) -> None:
+    paths.data_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(paths.db_file)
+    try:
+        configure_connection(conn)
+        migrate_schema(conn)
+        import_legacy_data_if_needed(conn, paths)
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise StorageError(f"failed to initialize database: {paths.db_file}") from exc
+    finally:
+        conn.close()
 
 
-def normalize_tags(tags: List[str]) -> List[str]:
-    normalized: List[str] = []
-    seen = set()
-    for tag in tags:
-        clean = tag.strip()
-        if clean and clean not in seen:
-            normalized.append(clean)
-            seen.add(clean)
-    return normalized
+@contextlib.contextmanager
+def db_conn(paths: RuntimePaths) -> Iterable[sqlite3.Connection]:
+    ensure_data_dir_exists(paths)
+    if not paths.db_file.exists():
+        raise NotInitializedError(init_guidance())
+    conn = sqlite3.connect(paths.db_file)
+    try:
+        configure_connection(conn)
+        migrate_schema(conn)
+        import_legacy_data_if_needed(conn, paths)
+        yield conn
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise StorageError(f"database operation failed: {exc}") from exc
+    finally:
+        conn.close()
 
 
-def recalc_stats(paths: StorePaths, index: Dict[str, Any]) -> None:
-    counts = {STATUS_OPEN: 0, STATUS_DONE: 0, STATUS_CANCELED: 0, STATUS_DELETED: 0}
-    for month in index["months"]:
-        payload = ensure_month_file(paths, month)
-        for todo in payload["todos"]:
-            counts[todo["status"]] = counts.get(todo["status"], 0) + 1
-    index["stats"] = {
-        "open": counts[STATUS_OPEN],
-        "done": counts[STATUS_DONE],
-        "canceled": counts[STATUS_CANCELED],
-        "deleted": counts[STATUS_DELETED],
-        "updated_at": now_cn_iso(),
-    }
-
-
-def add_month_if_missing(index: Dict[str, Any], month: str) -> None:
-    if month not in index["months"]:
-        index["months"].append(month)
-        index["months"].sort()
-
-
-def locate_todo(paths: StorePaths, index: Dict[str, Any], todo_id: str) -> tuple[str, Dict[str, Any], int]:
-    mapped_month = index["id_map"].get(todo_id)
-    if mapped_month:
-        payload = ensure_month_file(paths, mapped_month)
-        for idx, item in enumerate(payload["todos"]):
-            if item["id"] == todo_id:
-                return mapped_month, payload, idx
-        raise CorruptionError(f"id_map points to missing todo id: {todo_id}")
-    for month in index["months"]:
-        payload = ensure_month_file(paths, month)
-        for idx, item in enumerate(payload["todos"]):
-            if item["id"] == todo_id:
-                index["id_map"][todo_id] = month
-                return month, payload, idx
-    raise NotFoundError(f"todo not found: {todo_id}")
-
-
-def ensure_status_transition(current: str, target: str) -> None:
-    if current == target:
-        return
-    allowed = {
-        STATUS_OPEN: {STATUS_DONE, STATUS_CANCELED, STATUS_DELETED},
-        STATUS_DONE: {STATUS_OPEN, STATUS_DELETED},
-        STATUS_CANCELED: {STATUS_OPEN, STATUS_DELETED},
-        STATUS_DELETED: {STATUS_OPEN},
-    }
-    if target not in allowed.get(current, set()):
-        raise ValidationError(f"status transition not allowed: {current} -> {target}")
-
-
-def get_filter_date(todo: Dict[str, Any], by: str) -> Optional[date]:
-    if by == BY_CREATED:
-        return parse_iso_datetime(todo["created_at"], "created_at").astimezone(TZ_CN).date()
-    if by == BY_PLAN:
-        value = todo.get("plan_date")
-        return parse_day(value, "plan_date") if value else None
-    if by == BY_DUE:
-        value = todo.get("due_date")
-        return parse_day(value, "due_date") if value else None
-    raise ValidationError(f"invalid by option: {by}")
-
-
-def is_overdue(todo: Dict[str, Any], today: date) -> bool:
-    if todo.get("status") != STATUS_OPEN:
-        return False
-    due = todo.get("due_date")
-    if not due:
-        return False
-    return parse_day(due, "due_date") < today
-
-
-def format_todo_line(todo: Dict[str, Any], today: date) -> str:
-    parts = [f"[{todo['status'].upper()}]", todo["id"], todo["title"]]
-    parts.append(f"type={todo['type']}")
-    if todo.get("plan_date"):
-        parts.append(f"plan={todo['plan_date']}")
-    if todo.get("due_date"):
-        due_text = todo["due_date"]
-        if is_overdue(todo, today):
-            due_text += "(overdue)"
-        parts.append(f"due={due_text}")
-    if todo.get("tags"):
-        parts.append("tags=" + ",".join(todo["tags"]))
-    parts.append(f"month={todo['archive_month']}")
-    return " | ".join(parts)
-
-
-def choose_candidate_months(index: Dict[str, Any], by: str, from_day: Optional[date], to_day: Optional[date]) -> List[str]:
-    if from_day is None and to_day is None:
-        return list(index["months"])
-    start_day = from_day if from_day else date(1970, 1, 1)
-    end_day = to_day if to_day else date(2100, 12, 31)
-    if start_day > end_day:
-        raise ValidationError("--from cannot be greater than --to")
-    if by in (BY_PLAN, BY_DUE):
-        start_month = date(start_day.year, start_day.month, 1)
-        end_month = date(end_day.year, end_day.month, 1)
-        months: List[str] = []
-        cursor = start_month
-        while cursor <= end_month:
-            months.append(cursor.strftime(MONTH_FMT))
-            if cursor.month == 12:
-                cursor = date(cursor.year + 1, 1, 1)
-            else:
-                cursor = date(cursor.year, cursor.month + 1, 1)
-        return [m for m in months if m in index["months"]]
-    return list(index["months"])
-
-
-def sort_todos_for_view(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key_fn(todo: Dict[str, Any]) -> tuple[int, date, int]:
-        open_rank = 0 if todo["status"] == STATUS_OPEN else 1
-        due_raw = todo.get("due_date")
-        due_day = parse_day(due_raw, "due_date") if due_raw else date.max
-        created = parse_iso_datetime(todo["created_at"], "created_at").astimezone(TZ_CN)
-        return (open_rank, due_day, -int(created.timestamp()))
-
-    return sorted(todos, key=key_fn)
-
-
-def create_todo_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    title = args.title.strip()
-    if not title:
-        raise ValidationError("title cannot be empty")
-    if args.type not in ALL_TYPES:
-        raise ValidationError(f"invalid type: {args.type}")
-    plan_date = args.plan
-    due_date = args.due
-    if plan_date:
-        parse_day(plan_date, "plan_date")
-    if due_date:
-        parse_day(due_date, "due_date")
-    if args.type == TYPE_SHORT and not plan_date:
-        raise ValidationError("short todo requires --plan")
-
-    now_iso = now_cn_iso()
-    todo: Dict[str, Any] = {
-        "id": make_id(),
-        "title": title,
-        "type": args.type,
-        "status": STATUS_OPEN,
-        "created_at": now_iso,
-        "updated_at": now_iso,
-        "plan_date": plan_date,
-        "due_date": due_date,
-        "tags": normalize_tags(args.tag or []),
-        "note": args.note if args.note is not None else None,
-        "archive_month": "",
-    }
-    todo["archive_month"] = compute_archive_month(todo)
-    return todo
-
-
-def cmd_init(args: argparse.Namespace, base_paths: StorePaths) -> int:
-    if args.default and args.data_dir:
-        raise ValidationError("use either --default or --data-dir, not both")
-
-    if not args.default and not args.data_dir:
-        raise ValidationError(
-            "init requires one choice: --default (use skill/data) or --data-dir /absolute/path"
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current_version > SCHEMA_VERSION:
+        raise CorruptionError(
+            f"database schema version {current_version} is newer than this skill supports ({SCHEMA_VERSION})"
         )
-
-    if args.default:
-        data_dir = (base_paths.skill_root / "data").resolve()
-    else:
-        selected = pathlib.Path(args.data_dir)
-        if not selected.is_absolute():
-            raise ValidationError("--data-dir must be an absolute path")
-        data_dir = selected.resolve()
-
-    cfg = {
-        "version": VERSION,
-        "initialized": True,
-        "data_dir": str(data_dir),
-        "timezone": DEFAULT_TIMEZONE,
+    migrations = {
+        1: """
+            CREATE TABLE IF NOT EXISTS todos (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              due_at TEXT,
+              priority INTEGER NOT NULL CHECK(priority >= 1 AND priority <= 5),
+              status TEXT NOT NULL DEFAULT 'open',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_todos_status_due ON todos(status, due_at);
+            CREATE INDEX IF NOT EXISTS idx_todos_created_at ON todos(created_at DESC);
+            CREATE TABLE IF NOT EXISTS meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+            INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '1');
+        """,
     }
-    write_config(base_paths, cfg)
-    paths = base_paths.with_data_dir(data_dir)
-    ensure_index(paths)
-    print("Initialized todo skill.")
-    print(f"Config: {base_paths.config_file}")
-    print(f"DataDir: {paths.data_dir}")
-    return 0
+    while current_version < SCHEMA_VERSION:
+        target_version = current_version + 1
+        conn.executescript(migrations[target_version])
+        conn.execute(f"PRAGMA user_version = {target_version}")
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+            (str(target_version),),
+        )
+        current_version = target_version
 
 
-def cmd_add(args: argparse.Namespace, paths: StorePaths) -> int:
-    index = ensure_index(paths)
-    todo = create_todo_from_args(args)
-    month = todo["archive_month"]
-    payload = ensure_month_file(paths, month)
-    payload["todos"].insert(0, todo)
-    write_month_file(paths, month, payload)
-    add_month_if_missing(index, month)
-    index["id_map"][todo["id"]] = month
-    recalc_stats(paths, index)
-    write_index(paths, index)
-    print(f"Added: {format_todo_line(todo, now_cn().date())}")
-    print(f"DataDir: {paths.data_dir}")
-    return 0
+def import_legacy_data_if_needed(conn: sqlite3.Connection, paths: RuntimePaths) -> None:
+    count = conn.execute("SELECT COUNT(*) FROM todos").fetchone()[0]
+    if count > 0 or not paths.legacy_index_file.exists():
+        return
+
+    index = parse_json_file(paths.legacy_index_file)
+    months = index.get("months")
+    if not isinstance(months, list):
+        raise CorruptionError("legacy index.json missing months array")
+
+    for month in months:
+        if not isinstance(month, str):
+            raise CorruptionError("legacy month key must be string")
+        month_file = paths.data_dir / f"todos-{month}.json"
+        payload = parse_json_file(month_file)
+        todos = payload.get("todos")
+        if not isinstance(todos, list):
+            raise CorruptionError(f"legacy file {month_file.name} missing todos array")
+        for item in todos:
+            import_legacy_todo(conn, item)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_imported_at', ?)",
+        (serialize_dt(now_local()) or "",),
+    )
 
 
-def match_status(todo: Dict[str, Any], status_filter: str) -> bool:
-    return status_filter == "all" or todo["status"] == status_filter
+def import_legacy_todo(conn: sqlite3.Connection, item: Any) -> None:
+    if not isinstance(item, dict):
+        raise CorruptionError("legacy todo record must be an object")
+    todo_id = str(item.get("id") or make_todo_id())
+    title = str(item.get("title") or "").strip()
+    if not title:
+        raise CorruptionError("legacy todo missing title")
+    content = str(item.get("note") or "").strip()
+    due_at = None
+    due_date = item.get("due_date")
+    if isinstance(due_date, str) and due_date.strip():
+        due_at = serialize_dt(parse_due_value(due_date.strip()))
+    status = str(item.get("status") or STATUS_OPEN)
+    if status not in ALL_STATUSES:
+        status = STATUS_OPEN if status == "canceled" else STATUS_DONE if status == "done" else STATUS_ARCHIVED
+    created_at = serialize_dt(deserialize_dt(str(item.get("created_at")), "legacy created_at") or now_local())
+    updated_at = serialize_dt(deserialize_dt(str(item.get("updated_at")), "legacy updated_at") or now_local())
+    completed_at = updated_at if status == STATUS_DONE else None
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO todos(
+          id, title, content, due_at, priority, status, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            todo_id,
+            title,
+            content,
+            due_at,
+            3,
+            status,
+            created_at or serialize_dt(now_local()),
+            updated_at or serialize_dt(now_local()),
+            completed_at,
+        ),
+    )
 
 
-def match_date_range(todo: Dict[str, Any], by: str, from_day: Optional[date], to_day: Optional[date]) -> bool:
-    if from_day is None and to_day is None:
-        return True
-    target = get_filter_date(todo, by)
-    if target is None:
-        return False
-    if from_day is not None and target < from_day:
-        return False
-    if to_day is not None and target > to_day:
-        return False
-    return True
+def make_todo_payload(row: sqlite3.Row) -> dict[str, Any]:
+    due_at = deserialize_dt(row["due_at"], "todos.due_at")
+    created_at = deserialize_dt(row["created_at"], "todos.created_at")
+    updated_at = deserialize_dt(row["updated_at"], "todos.updated_at")
+    completed_at = deserialize_dt(row["completed_at"], "todos.completed_at")
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "content": row["content"],
+        "due_at": serialize_dt(due_at),
+        "priority": row["priority"],
+        "status": row["status"],
+        "created_at": serialize_dt(created_at),
+        "updated_at": serialize_dt(updated_at),
+        "completed_at": serialize_dt(completed_at),
+    }
 
 
-def match_due_state(todo: Dict[str, Any], due_state: str, today: date) -> bool:
-    if due_state == DUE_ALL:
-        return True
-    overdue = is_overdue(todo, today)
-    if due_state == DUE_OVERDUE:
-        return overdue
-    if due_state == DUE_NOT_OVERDUE:
-        return not overdue
-    raise ValidationError(f"invalid due-state: {due_state}")
+def format_todo_line(todo: dict[str, Any]) -> str:
+    due_text = format_local(deserialize_dt(todo["due_at"], "todo.due_at"))
+    stars = "★" * int(todo["priority"])
+    return (
+        f"[{todo['status'].upper()}] {todo['id']} | {todo['title']} | "
+        f"priority={stars} | due={due_text}"
+    )
 
 
-def cmd_list(args: argparse.Namespace, paths: StorePaths) -> int:
-    if args.status != "all" and args.status not in ALL_STATUS:
-        raise ValidationError(f"invalid --status value: {args.status}")
-    if args.by not in ALL_BY:
-        raise ValidationError(f"invalid --by value: {args.by}")
-    if args.due_state not in ALL_DUE_STATE:
-        raise ValidationError(f"invalid --due-state value: {args.due_state}")
-
-    from_day = parse_day(args.from_date, "--from") if args.from_date else None
-    to_day = parse_day(args.to_date, "--to") if args.to_date else None
-    if from_day and to_day and from_day > to_day:
-        raise ValidationError("--from cannot be greater than --to")
-
-    index = ensure_index(paths)
-    candidate_months = choose_candidate_months(index, args.by, from_day, to_day)
-    today = now_cn().date()
-    todos: List[Dict[str, Any]] = []
-    for month in candidate_months:
-        payload = ensure_month_file(paths, month)
-        for todo in payload["todos"]:
-            if not match_status(todo, args.status):
-                continue
-            if not match_date_range(todo, args.by, from_day, to_day):
-                continue
-            if not match_due_state(todo, args.due_state, today):
-                continue
-            todos.append(todo)
-    todos = sort_todos_for_view(todos)
-    if args.json:
-        print(json.dumps({"data_dir": str(paths.data_dir), "count": len(todos), "todos": todos}, ensure_ascii=False, indent=2))
-        return 0
+def print_todos(todos: list[dict[str, Any]], data_dir: pathlib.Path, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"data_dir": str(data_dir), "count": len(todos), "todos": todos}, ensure_ascii=False, indent=2))
+        return
     if not todos:
         print("No todos matched.")
-        print(f"DataDir: {paths.data_dir}")
-        return 0
+        print(f"DataDir: {data_dir}")
+        return
     for todo in todos:
-        print(format_todo_line(todo, today))
-    print(f"DataDir: {paths.data_dir}")
+        print(format_todo_line(todo))
+        print(f"  Content: {todo['content']}")
+    print(f"DataDir: {data_dir}")
+
+
+def print_single_todo(todo: dict[str, Any], data_dir: pathlib.Path, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"data_dir": str(data_dir), "todo": todo}, ensure_ascii=False, indent=2))
+        return
+    print(format_todo_line(todo))
+    print(f"  Content: {todo['content']}")
+    print(f"  Created: {format_local(deserialize_dt(todo['created_at'], 'todo.created_at'))}")
+    print(f"  Updated: {format_local(deserialize_dt(todo['updated_at'], 'todo.updated_at'))}")
+    if todo["completed_at"]:
+        print(f"  Completed: {format_local(deserialize_dt(todo['completed_at'], 'todo.completed_at'))}")
+    print(f"DataDir: {data_dir}")
+
+
+def fetch_todo_row(conn: sqlite3.Connection, todo_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"todo not found: {todo_id}")
+    return row
+
+
+def insert_todo(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    content: str,
+    priority: int,
+    due_at: dt.datetime | None,
+) -> dict[str, Any]:
+    clean_title = title.strip()
+    clean_content = content.strip()
+    if not clean_title:
+        raise ValidationError("title cannot be empty")
+    if not clean_content:
+        raise ValidationError("content cannot be empty")
+    priority = parse_priority(priority)
+    todo_id = make_todo_id()
+    now_value = serialize_dt(now_local())
+    conn.execute(
+        """
+        INSERT INTO todos(id, title, content, due_at, priority, status, created_at, updated_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            todo_id,
+            clean_title,
+            clean_content,
+            serialize_dt(due_at),
+            priority,
+            STATUS_OPEN,
+            now_value,
+            now_value,
+        ),
+    )
+    row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+    if row is None:
+        raise StorageError(f"failed to reload todo after insert: {todo_id}")
+    return make_todo_payload(row)
+
+
+def update_todo_fields(
+    conn: sqlite3.Connection,
+    todo_id: str,
+    *,
+    title: str | None = None,
+    content: str | None = None,
+    priority: int | None = None,
+    due_at: dt.datetime | None = None,
+    clear_due: bool = False,
+) -> dict[str, Any]:
+    current = make_todo_payload(fetch_todo_row(conn, todo_id))
+    next_title = current["title"] if title is None else title.strip()
+    next_content = current["content"] if content is None else content.strip()
+    next_priority = current["priority"] if priority is None else parse_priority(priority)
+    next_due = current["due_at"] if due_at is None else serialize_dt(due_at)
+    if clear_due:
+        next_due = None
+    if not next_title:
+        raise ValidationError("title cannot be empty")
+    if not next_content:
+        raise ValidationError("content cannot be empty")
+
+    now_value = serialize_dt(now_local())
+    conn.execute(
+        """
+        UPDATE todos
+        SET title = ?, content = ?, priority = ?, due_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (next_title, next_content, next_priority, next_due, now_value, todo_id),
+    )
+    return make_todo_payload(fetch_todo_row(conn, todo_id))
+
+
+def set_todo_status(conn: sqlite3.Connection, todo_id: str, status: str) -> dict[str, Any]:
+    if status not in ALL_STATUSES:
+        raise ValidationError(f"invalid status: {status}")
+    current = make_todo_payload(fetch_todo_row(conn, todo_id))
+    now_value = serialize_dt(now_local())
+    completed_at = current["completed_at"]
+    if status == STATUS_DONE:
+        completed_at = now_value
+    elif status == STATUS_OPEN:
+        completed_at = None
+    conn.execute(
+        """
+        UPDATE todos
+        SET status = ?, updated_at = ?, completed_at = ?
+        WHERE id = ?
+        """,
+        (status, now_value, completed_at, todo_id),
+    )
+    return make_todo_payload(fetch_todo_row(conn, todo_id))
+
+
+def parse_status_filter(value: str) -> str:
+    if value == "all":
+        return value
+    if value not in ALL_STATUSES:
+        raise ValidationError("status must be open, done, archived, or all")
+    return value
+
+
+def parse_day_range(raw: str, field_name: str, *, end_of_day: bool) -> str:
+    try:
+        parsed = dt.datetime.strptime(raw, DATE_FMT).date()
+    except ValueError as exc:
+        raise ValidationError(f"{field_name} must be YYYY-MM-DD") from exc
+    clock = dt.time.max if end_of_day else dt.time.min
+    return serialize_dt(dt.datetime.combine(parsed, clock, tzinfo=now_local().tzinfo)) or ""
+
+
+def build_list_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...], bool]:
+    clauses = ["1=1"]
+    params: list[Any] = []
+
+    status = parse_status_filter(args.status)
+    include_archived = args.include_archived or status in {"archived", "all"}
+    if status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+
+    min_priority = optional_priority(args.min_priority)
+    max_priority = optional_priority(args.max_priority)
+    if min_priority is not None and max_priority is not None and min_priority > max_priority:
+        raise ValidationError("--min-priority cannot be greater than --max-priority")
+    if min_priority is not None:
+        clauses.append("priority >= ?")
+        params.append(min_priority)
+    if max_priority is not None:
+        clauses.append("priority <= ?")
+        params.append(max_priority)
+
+    if args.from_date:
+        clauses.append("due_at IS NOT NULL AND due_at >= ?")
+        params.append(parse_day_range(args.from_date, "--from", end_of_day=False))
+    if args.to_date:
+        clauses.append("due_at IS NOT NULL AND due_at <= ?")
+        params.append(parse_day_range(args.to_date, "--to", end_of_day=True))
+
+    if args.overdue:
+        clauses.append("status = ?")
+        params.append(STATUS_OPEN)
+        clauses.append("due_at IS NOT NULL AND due_at < ?")
+        params.append(serialize_dt(now_local()) or "")
+
+    if args.keyword:
+        clauses.append("(title LIKE ? OR content LIKE ?)")
+        keyword = f"%{args.keyword.strip()}%"
+        params.extend([keyword, keyword])
+
+    if args.no_due:
+        clauses.append("due_at IS NULL")
+
+    return " AND ".join(clauses), tuple(params), include_archived
+
+
+def apply_limit(todos: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    if limit is None:
+        return todos
+    if limit <= 0:
+        raise ValidationError("--limit must be greater than 0")
+    return todos[:limit]
+
+
+def cmd_show(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        todo = make_todo_payload(fetch_todo_row(conn, args.id))
+    print_single_todo(todo, paths.data_dir, args.json)
     return 0
 
 
-def cmd_show(args: argparse.Namespace, paths: StorePaths) -> int:
-    index = ensure_index(paths)
-    month, payload, idx = locate_todo(paths, index, args.id)
-    todo = payload["todos"][idx]
-    if args.json:
-        print(json.dumps({"month": month, "todo": todo, "data_dir": str(paths.data_dir)}, ensure_ascii=False, indent=2))
+def cmd_init(args: argparse.Namespace, base: BasePaths) -> int:
+    if args.default and args.data_dir:
+        raise ValidationError("use either --default or --data-dir, not both")
+    if not args.default and not args.data_dir:
+        raise ValidationError("init requires one of --default or --data-dir /absolute/existing/path")
+
+    if args.default:
+        data_dir = (base.skill_root / "data").resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
     else:
-        print(format_todo_line(todo, now_cn().date()))
-        print(f"DataDir: {paths.data_dir}")
+        candidate = pathlib.Path(args.data_dir).expanduser()
+        if not candidate.is_absolute():
+            raise ValidationError("--data-dir must be an absolute path")
+        if not candidate.exists():
+            raise ValidationError("--data-dir must already exist")
+        if not candidate.is_dir():
+            raise ValidationError("--data-dir must point to a directory")
+        data_dir = candidate.resolve()
+
+    cfg = {
+        "version": CONFIG_VERSION,
+        "initialized": True,
+        "data_dir": str(data_dir),
+        "database_name": DEFAULT_DB_NAME,
+        "timezone": DEFAULT_TIMEZONE,
+    }
+    save_config(base, cfg)
+    initialize_storage(resolve_runtime_paths(base, cfg))
+    print("Todo skill initialized.")
+    print(f"Config: {base.config_file}")
+    print(f"DataDir: {data_dir}")
     return 0
 
 
-def persist_todo_update(
-    paths: StorePaths,
-    index: Dict[str, Any],
-    current_month: str,
-    payload: Dict[str, Any],
-    idx: int,
-    todo: Dict[str, Any],
-) -> None:
-    target_month = compute_archive_month(todo)
-    todo["archive_month"] = target_month
-    if target_month == current_month:
-        payload["todos"][idx] = todo
-        write_month_file(paths, current_month, payload)
-    else:
-        payload["todos"].pop(idx)
-        write_month_file(paths, current_month, payload)
-        target_payload = ensure_month_file(paths, target_month)
-        target_payload["todos"].insert(0, todo)
-        write_month_file(paths, target_month, target_payload)
-        add_month_if_missing(index, target_month)
-    index["id_map"][todo["id"]] = target_month
-    recalc_stats(paths, index)
-    write_index(paths, index)
+def cmd_show_config(args: argparse.Namespace, base: BasePaths) -> int:
+    cfg = load_config(base)
+    runtime = resolve_runtime_paths(base, cfg)
+    payload = {
+        "initialized": cfg["initialized"],
+        "data_dir": str(runtime.data_dir),
+        "db_file": str(runtime.db_file),
+        "timezone": cfg["timezone"],
+        "config_file": str(base.config_file),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
 
 
-def set_status(paths: StorePaths, todo_id: str, target_status: str, action_label: str) -> int:
-    index = ensure_index(paths)
-    month, payload, idx = locate_todo(paths, index, todo_id)
-    todo = payload["todos"][idx]
-    ensure_status_transition(todo["status"], target_status)
-    todo["status"] = target_status
-    todo["updated_at"] = now_cn_iso()
-    persist_todo_update(paths, index, month, payload, idx, todo)
-    print(f"{action_label}: {format_todo_line(todo, now_cn().date())}")
+def cmd_add(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    due_at = parse_due_value(args.due) if args.due else None
+    with db_conn(paths) as conn:
+        todo = insert_todo(
+            conn,
+            title=args.title,
+            content=args.content,
+            priority=args.priority,
+            due_at=due_at,
+        )
+    print(f"Added: {format_todo_line(todo)}")
+    print(f"  Content: {todo['content']}")
     print(f"DataDir: {paths.data_dir}")
     return 0
 
 
-def cmd_done(args: argparse.Namespace, paths: StorePaths) -> int:
-    return set_status(paths, args.id, STATUS_DONE, "Done")
+def cmd_add_today(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    args.due = make_due_end_of_day(0).strftime(DATETIME_FMT)
+    return cmd_add(args, paths)
 
 
-def cmd_reopen(args: argparse.Namespace, paths: StorePaths) -> int:
-    return set_status(paths, args.id, STATUS_OPEN, "Reopened")
+def cmd_add_tomorrow(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    args.due = make_due_end_of_day(1).strftime(DATETIME_FMT)
+    return cmd_add(args, paths)
 
 
-def cmd_cancel(args: argparse.Namespace, paths: StorePaths) -> int:
-    return set_status(paths, args.id, STATUS_CANCELED, "Canceled")
+def fetch_todos(
+    conn: sqlite3.Connection,
+    *,
+    where_clause: str = "1=1",
+    params: tuple[Any, ...] = (),
+    include_archived: bool = False,
+) -> list[dict[str, Any]]:
+    status_filter = "" if include_archived else "AND status != 'archived'"
+    query = f"""
+        SELECT *
+        FROM todos
+        WHERE {where_clause} {status_filter}
+        ORDER BY
+          CASE status WHEN 'open' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+          due_at IS NULL,
+          due_at ASC,
+          created_at DESC
+    """
+    rows = conn.execute(query, params).fetchall()
+    return [make_todo_payload(row) for row in rows]
 
 
-def cmd_rm(args: argparse.Namespace, paths: StorePaths) -> int:
-    return set_status(paths, args.id, STATUS_DELETED, "SoftDeleted")
+def cmd_list_today(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    now_value = now_local()
+    day_start = dt.datetime.combine(now_value.date(), dt.time.min, tzinfo=now_value.tzinfo)
+    day_end = dt.datetime.combine(now_value.date(), dt.time.max, tzinfo=now_value.tzinfo)
+    with db_conn(paths) as conn:
+        todos = fetch_todos(
+            conn,
+            where_clause="due_at IS NOT NULL AND due_at >= ? AND due_at <= ?",
+            params=(serialize_dt(day_start), serialize_dt(day_end)),
+        )
+    print_todos(todos, paths.data_dir, args.json)
+    return 0
 
 
-def cmd_update(args: argparse.Namespace, paths: StorePaths) -> int:
-    index = ensure_index(paths)
-    month, payload, idx = locate_todo(paths, index, args.id)
-    todo = dict(payload["todos"][idx])
-    changed = False
-    if args.title is not None:
-        title = args.title.strip()
-        if not title:
-            raise ValidationError("title cannot be empty")
-        todo["title"] = title
-        changed = True
-    if args.type is not None:
-        todo["type"] = args.type
-        changed = True
-    if args.plan is not None:
-        parse_day(args.plan, "plan_date")
-        todo["plan_date"] = args.plan
-        changed = True
-    if args.clear_plan:
-        todo["plan_date"] = None
-        changed = True
-    if args.due is not None:
-        parse_day(args.due, "due_date")
-        todo["due_date"] = args.due
-        changed = True
-    if args.clear_due:
-        todo["due_date"] = None
-        changed = True
-    if args.tag is not None:
-        todo["tags"] = normalize_tags(args.tag)
-        changed = True
-    if args.note is not None:
-        todo["note"] = args.note
-        changed = True
-    if args.clear_note:
-        todo["note"] = None
-        changed = True
-    if todo["type"] == TYPE_SHORT and not todo.get("plan_date"):
-        raise ValidationError("short todo requires plan_date")
-    if not changed:
-        raise ValidationError("no updates provided")
-    todo["updated_at"] = now_cn_iso()
-    persist_todo_update(paths, index, month, payload, idx, todo)
-    print(f"Updated: {format_todo_line(todo, now_cn().date())}")
+def cmd_list_all(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        where_clause, params, include_archived = build_list_query(args)
+        todos = fetch_todos(conn, where_clause=where_clause, params=params, include_archived=include_archived)
+        todos = apply_limit(todos, args.limit)
+    print_todos(todos, paths.data_dir, args.json)
+    return 0
+
+
+def cmd_done(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        todo = set_todo_status(conn, args.id, STATUS_DONE)
+    print(f"Done: {format_todo_line(todo)}")
     print(f"DataDir: {paths.data_dir}")
     return 0
 
 
-def cmd_overdue(args: argparse.Namespace, paths: StorePaths) -> int:
-    args.status = STATUS_OPEN
-    args.by = args.by or BY_DUE
-    args.due_state = DUE_OVERDUE
-    return cmd_list(args, paths)
+def cmd_reopen(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        todo = set_todo_status(conn, args.id, STATUS_OPEN)
+    print(f"Reopened: {format_todo_line(todo)}")
+    print(f"DataDir: {paths.data_dir}")
+    return 0
+
+
+def cmd_archive(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        todo = set_todo_status(conn, args.id, STATUS_ARCHIVED)
+    print(f"Archived: {format_todo_line(todo)}")
+    print(f"DataDir: {paths.data_dir}")
+    return 0
+
+
+def cmd_update(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    if (
+        args.title is None
+        and args.content is None
+        and args.priority is None
+        and args.due is None
+        and not args.clear_due
+    ):
+        raise ValidationError("provide at least one field to update")
+    if args.due and args.clear_due:
+        raise ValidationError("use either --due or --clear-due, not both")
+
+    due_at = parse_due_value(args.due) if args.due else None
+    with db_conn(paths) as conn:
+        todo = update_todo_fields(
+            conn,
+            args.id,
+            title=args.title,
+            content=args.content,
+            priority=args.priority,
+            due_at=due_at,
+            clear_due=args.clear_due,
+        )
+    print(f"Updated: {format_todo_line(todo)}")
+    print(f"  Content: {todo['content']}")
+    print(f"DataDir: {paths.data_dir}")
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    with db_conn(paths) as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM todos
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall()
+        overdue = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM todos
+            WHERE status = ? AND due_at IS NOT NULL AND due_at < ?
+            """,
+            (STATUS_OPEN, serialize_dt(now_local())),
+        ).fetchone()["count"]
+        due_today = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM todos
+            WHERE due_at IS NOT NULL AND due_at >= ? AND due_at <= ?
+            """,
+            (
+                parse_day_range(now_local().date().strftime(DATE_FMT), "today", end_of_day=False),
+                parse_day_range(now_local().date().strftime(DATE_FMT), "today", end_of_day=True),
+            ),
+        ).fetchone()["count"]
+    payload = {row["status"]: row["count"] for row in rows}
+    payload["overdue_open"] = overdue
+    payload["due_today"] = due_today
+    payload["data_dir"] = str(paths.data_dir)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
 
 
 def build_parser() -> StrictArgumentParser:
-    parser = StrictArgumentParser(prog="todo.py", add_help=True)
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser = StrictArgumentParser(prog="todo.py")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    init_p = sub.add_parser("init", help="initialize storage path")
-    init_p.add_argument("--default", action="store_true", help="use <skill>/data as storage")
-    init_p.add_argument("--data-dir", default=None, help="absolute storage directory path")
+    init_p = sub.add_parser("init", help="confirm and initialize storage directory")
+    init_p.add_argument("--default", action="store_true", help="use <skill>/data")
+    init_p.add_argument("--data-dir", default=None, help="absolute existing directory path")
     init_p.set_defaults(handler=cmd_init)
 
-    add_p = sub.add_parser("add", help="add todo")
-    add_p.add_argument("--type", required=True, choices=sorted(ALL_TYPES))
+    show_cfg_p = sub.add_parser("show-config", help="show current configuration")
+    show_cfg_p.set_defaults(handler=cmd_show_config)
+
+    add_p = sub.add_parser("add", help="add a todo")
     add_p.add_argument("--title", required=True)
-    add_p.add_argument("--plan", default=None, help="YYYY-MM-DD")
-    add_p.add_argument("--due", default=None, help="YYYY-MM-DD")
-    add_p.add_argument("--tag", action="append", default=[])
-    add_p.add_argument("--note", default=None)
+    add_p.add_argument("--content", required=True)
+    add_p.add_argument("--priority", required=True, type=int)
+    add_p.add_argument("--due", default=None, help="YYYY-MM-DD or YYYY-MM-DDTHH:MM")
     add_p.set_defaults(handler=cmd_add)
 
-    list_p = sub.add_parser("list", help="list todos")
-    list_p.add_argument("--status", default=STATUS_OPEN, help="open|done|canceled|deleted|all")
-    list_p.add_argument("--by", default=BY_CREATED, help="created|plan|due")
-    list_p.add_argument("--from", dest="from_date", default=None, help="YYYY-MM-DD")
-    list_p.add_argument("--to", dest="to_date", default=None, help="YYYY-MM-DD")
-    list_p.add_argument("--due-state", default=DUE_ALL, help="overdue|not-overdue|all")
-    list_p.add_argument("--json", action="store_true")
-    list_p.set_defaults(handler=cmd_list)
+    add_today_p = sub.add_parser("add-today", help="add a todo due today at 23:59")
+    add_today_p.add_argument("--title", required=True)
+    add_today_p.add_argument("--content", required=True)
+    add_today_p.add_argument("--priority", required=True, type=int)
+    add_today_p.set_defaults(handler=cmd_add_today)
 
-    show_p = sub.add_parser("show", help="show single todo")
+    add_tomorrow_p = sub.add_parser("add-tomorrow", help="add a todo due tomorrow at 23:59")
+    add_tomorrow_p.add_argument("--title", required=True)
+    add_tomorrow_p.add_argument("--content", required=True)
+    add_tomorrow_p.add_argument("--priority", required=True, type=int)
+    add_tomorrow_p.set_defaults(handler=cmd_add_tomorrow)
+
+    list_today_p = sub.add_parser("list-today", help="list todos due today")
+    list_today_p.add_argument("--json", action="store_true")
+    list_today_p.set_defaults(handler=cmd_list_today)
+
+    show_p = sub.add_parser("show", help="show one todo")
     show_p.add_argument("--id", required=True)
     show_p.add_argument("--json", action="store_true")
     show_p.set_defaults(handler=cmd_show)
 
-    done_p = sub.add_parser("done", help="mark done")
+    list_all_p = sub.add_parser("list-all", help="list all todos")
+    list_all_p.add_argument("--json", action="store_true")
+    list_all_p.add_argument("--status", default="all", help="open|done|archived|all")
+    list_all_p.add_argument("--min-priority", type=int, default=None)
+    list_all_p.add_argument("--max-priority", type=int, default=None)
+    list_all_p.add_argument("--from", dest="from_date", default=None, help="filter due_at from YYYY-MM-DD")
+    list_all_p.add_argument("--to", dest="to_date", default=None, help="filter due_at to YYYY-MM-DD")
+    list_all_p.add_argument("--keyword", default=None, help="search title and content")
+    list_all_p.add_argument("--overdue", action="store_true", help="only open overdue todos")
+    list_all_p.add_argument("--no-due", action="store_true", help="only todos without due date")
+    list_all_p.add_argument("--limit", type=int, default=None)
+    list_all_p.add_argument("--include-archived", action="store_true")
+    list_all_p.set_defaults(handler=cmd_list_all)
+
+    done_p = sub.add_parser("done", help="mark a todo as done")
     done_p.add_argument("--id", required=True)
     done_p.set_defaults(handler=cmd_done)
 
-    reopen_p = sub.add_parser("reopen", help="reopen todo")
+    reopen_p = sub.add_parser("reopen", help="reopen a done or archived todo")
     reopen_p.add_argument("--id", required=True)
     reopen_p.set_defaults(handler=cmd_reopen)
 
-    cancel_p = sub.add_parser("cancel", help="cancel todo")
-    cancel_p.add_argument("--id", required=True)
-    cancel_p.set_defaults(handler=cmd_cancel)
+    archive_p = sub.add_parser("archive", help="archive a todo without deleting data")
+    archive_p.add_argument("--id", required=True)
+    archive_p.set_defaults(handler=cmd_archive)
 
-    rm_p = sub.add_parser("rm", help="soft delete todo")
-    rm_p.add_argument("--id", required=True)
-    rm_p.set_defaults(handler=cmd_rm)
-
-    update_p = sub.add_parser("update", help="update todo")
+    update_p = sub.add_parser("update", help="update fields on a todo")
     update_p.add_argument("--id", required=True)
     update_p.add_argument("--title", default=None)
-    update_p.add_argument("--type", default=None, choices=sorted(ALL_TYPES))
-    update_p.add_argument("--plan", default=None, help="YYYY-MM-DD")
-    update_p.add_argument("--clear-plan", action="store_true")
-    update_p.add_argument("--due", default=None, help="YYYY-MM-DD")
+    update_p.add_argument("--content", default=None)
+    update_p.add_argument("--priority", type=int, default=None)
+    update_p.add_argument("--due", default=None, help="YYYY-MM-DD or YYYY-MM-DDTHH:MM")
     update_p.add_argument("--clear-due", action="store_true")
-    update_p.add_argument("--tag", action="append")
-    update_p.add_argument("--note", default=None)
-    update_p.add_argument("--clear-note", action="store_true")
     update_p.set_defaults(handler=cmd_update)
 
-    overdue_p = sub.add_parser("overdue", help="list overdue open todos")
-    overdue_p.add_argument("--by", default=BY_DUE, help="created|plan|due")
-    overdue_p.add_argument("--from", dest="from_date", default=None, help="YYYY-MM-DD")
-    overdue_p.add_argument("--to", dest="to_date", default=None, help="YYYY-MM-DD")
-    overdue_p.add_argument("--json", action="store_true")
-    overdue_p.set_defaults(handler=cmd_overdue)
+    stats_p = sub.add_parser("stats", help="show todo counts and urgency summary")
+    stats_p.set_defaults(handler=cmd_stats)
     return parser
 
 
 def run() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    base_paths = StorePaths.from_script()
-    try:
-        if args.cmd == "init":
-            return int(args.handler(args, base_paths))
+    base = BasePaths.detect()
 
-        cfg = load_config(base_paths)
-        ensure_initialized(base_paths, cfg)
-        paths = base_paths.with_data_dir(resolve_configured_data_dir(base_paths, cfg))
+    try:
+        if args.command in {"init", "show-config"}:
+            return int(args.handler(args, base))
+
+        cfg = load_config(base)
+        ensure_initialized(cfg)
+        paths = resolve_runtime_paths(base, cfg)
         return int(args.handler(args, paths))
     except TodoError as exc:
-        print(f"{exc.prefix}: {exc.message}", file=os.sys.stderr)
-        if exc.exit_code in (EXIT_STORAGE, EXIT_CORRUPTION):
-            print(f"Config: {base_paths.config_file}", file=os.sys.stderr)
+        prefix = ERROR_PREFIXES[exc.kind]
+        print(f"{prefix}: {exc.message}", file=sys.stderr)
         return exc.exit_code
 
 

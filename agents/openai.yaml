@@ -1,0 +1,4 @@
+version: 1
+display_name: Todo Master
+short_description: Manage local todos in OpenClaw with a Python CLI and SQLite-backed storage.
+default_prompt: Add, review, update, complete, reopen, and archive local todos; confirm the storage directory on first use, and keep data safe across skill upgrades with SQLite migrations.
